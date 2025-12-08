@@ -10,6 +10,9 @@
 #include "leveldb/options.h"
 #include "leveldb/write_batch.h"
 #include "util/testutil.h"
+#include <thread>
+#include <vector>
+#include <atomic>
 
 namespace leveldb {
 
@@ -113,6 +116,31 @@ TEST_F(TransactionTest, AbortRollback) {
   Status s = txn.Commit();
   ASSERT_FALSE(s.ok());
   ASSERT_EQ(Get("k"), "NOT_FOUND");
+}
+
+TEST_F(TransactionTest, ConcurrentTransactionsSingleKey) {
+  const int kThreads = 8;
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([this, i, &success_count]() {
+      Transaction txn(db());
+      txn.Put("concurrent_key", std::to_string(i));
+      if (txn.Commit().ok()) {
+        success_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  for (auto& t : threads) t.join();
+
+  // At least one transaction should have succeeded.
+  ASSERT_GE(success_count.load(std::memory_order_relaxed), 1);
+
+  // The final value should be one of the committed values (not NOT_FOUND).
+  std::string val = Get("concurrent_key");
+  ASSERT_NE(val, "NOT_FOUND");
 }
 
 }  // namespace leveldb
