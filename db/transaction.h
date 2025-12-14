@@ -65,7 +65,6 @@ class Transaction {
   };
 
   Status CheckActive() const;
-  Status ValidateReadSet();
   Status ValidateWriteSet();
 
   DB* db_;

@@ -45,6 +45,38 @@ Status Transaction::CheckActive() const {
   return Status::OK();
 }
 
+static Status ValidateSnapshotIsolation(DB* db, const Snapshot* snapshot,
+                                       const Slice& key, std::string* value) {
+  std::string value_at_snapshot;
+
+  // Read value at our snapshot
+  ReadOptions snap_opts;
+  snap_opts.snapshot = snapshot;
+  Status snap_status = db->Get(snap_opts, key, &value_at_snapshot);
+
+  // Read current value (latest committed state)
+  ReadOptions current_opts;
+  Status current_status = db->Get(current_opts, key, value);
+
+  // Check for conflicts
+  bool existed_at_snapshot = snap_status.ok();
+  bool exists_now = current_status.ok();
+
+  if (existed_at_snapshot != exists_now) {
+    // Key was added or deleted
+    return Status::Corruption(
+        "Read-write conflict: key modified by another transaction", key.ToString());
+  }
+
+  if (existed_at_snapshot && exists_now && value_at_snapshot != *value) {
+    // Key value changed
+    return Status::Corruption(
+        "Read-write conflict: key modified by another transaction", key.ToString());
+  }
+
+  return Status::OK();
+}
+
 Status Transaction::Get(const ReadOptions& options, const Slice& key, 
                         std::string* value) {
   Status s = CheckActive();
@@ -65,13 +97,7 @@ Status Transaction::Get(const ReadOptions& options, const Slice& key,
     return Status::OK();
   }
 
-  // Track this read for conflict detection
-  read_set_.insert(key_str);
-
-  // Read from database at snapshot
-  ReadOptions tx_options = options;
-  tx_options.snapshot = snapshot_;
-  return db_->Get(tx_options, key, value);
+  return ValidateSnapshotIsolation(db_, snapshot_, key, value);
 }
 
 Status Transaction::Put(const Slice& key, const Slice& value) {
@@ -109,78 +135,14 @@ Status Transaction::Delete(const Slice& key) {
   return Status::OK();
 }
 
-Status Transaction::ValidateReadSet() {
-  // Check that all keys we read haven't been modified
-  for (const auto& key_str : read_set_) {
-    // Skip keys we also wrote (they're allowed to change)
-    if (write_buffer_.find(key_str) != write_buffer_.end()) {
-      continue;
-    }
-
-    Slice key(key_str);
-    std::string value_at_snapshot;
-    std::string value_current;
-
-    // Read value at our snapshot
-    ReadOptions snap_opts;
-    snap_opts.snapshot = snapshot_;
-    Status snap_status = db_->Get(snap_opts, key, &value_at_snapshot);
-
-    // Read current value (latest committed state)
-    ReadOptions current_opts;
-    Status current_status = db_->Get(current_opts, key, &value_current);
-
-    // Check for conflicts
-    bool existed_at_snapshot = snap_status.ok();
-    bool exists_now = current_status.ok();
-
-    if (existed_at_snapshot != exists_now) {
-      // Key was added or deleted
-      return Status::Corruption(
-          "Read-write conflict: key modified by another transaction", key_str);
-    }
-
-    if (existed_at_snapshot && exists_now && value_at_snapshot != value_current) {
-      // Key value changed
-      return Status::Corruption(
-          "Read-write conflict: key modified by another transaction", key_str);
-    }
-  }
-
-  return Status::OK();
-}
-
 Status Transaction::ValidateWriteSet() {
   // Check that all keys we're writing haven't been modified
   for (const auto& entry : write_buffer_) {
     const std::string& key_str = entry.first;
     Slice key(key_str);
-    std::string value_at_snapshot;
-    std::string value_current;
-
-    // Read value at our snapshot
-    ReadOptions snap_opts;
-    snap_opts.snapshot = snapshot_;
-    Status snap_status = db_->Get(snap_opts, key, &value_at_snapshot);
-
-    // Read current value
-    ReadOptions current_opts;
-    Status current_status = db_->Get(current_opts, key, &value_current);
-
-    // Check for conflicts
-    bool existed_at_snapshot = snap_status.ok();
-    bool exists_now = current_status.ok();
-
-    if (existed_at_snapshot != exists_now) {
-      // Key was added or deleted by another transaction
-      return Status::Corruption(
-          "Write-write conflict: key modified by another transaction", key_str);
-    }
-
-    if (existed_at_snapshot && exists_now && value_at_snapshot != value_current) {
-      // Key value changed by another transaction
-      return Status::Corruption(
-          "Write-write conflict: key modified by another transaction", key_str);
+    Status s = ValidateSnapshotIsolation(db_, snapshot_, key, nullptr);
+    if (!s.ok()) {
+      return s;
     }
   }
 
@@ -202,12 +164,6 @@ Status Transaction::Commit() {
   // Acquire global commit lock to prevent race conditions during validation
   // This ensures atomicity of validation + commit
   std::lock_guard<std::mutex> lock(TransactionManager::Instance().GetCommitLock());
-
-  // Validate read set (detect if any read values changed)
-  s = ValidateReadSet();
-  if (!s.ok()) {
-    return s;
-  }
 
   // Validate write set (detect write-write conflicts)
   s = ValidateWriteSet();
