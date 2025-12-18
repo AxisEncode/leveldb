@@ -6,20 +6,21 @@
 
 namespace leveldb {
 
+std::mutex Transaction::commit_mutex_;
+
 Transaction::Transaction(DB* db)
     : db_(db),
       snapshot_(nullptr),
-      committed_(false),
-      aborted_(false) {
+      state_(TransactionState::ACTIVE) {
   if (db_ == nullptr) {
-    aborted_ = true;
+    state_ = TransactionState::ABORTED;
     return;
   }
   
   // Acquire a snapshot at transaction begin for snapshot isolation
   snapshot_ = db_->GetSnapshot();
   if (snapshot_ == nullptr) {
-    aborted_ = true;
+    state_ = TransactionState::ABORTED;
   }
 }
 
@@ -30,10 +31,10 @@ Transaction::~Transaction() {
 }
 
 Status Transaction::CheckActive() const {
-  if (aborted_) {
+  if (state_ == TransactionState::ABORTED) {
     return Status::InvalidArgument("Transaction has been aborted");
   }
-  if (committed_) {
+  if (state_ == TransactionState::COMMITTED) {
     return Status::InvalidArgument("Transaction has been committed");
   }
   if (db_ == nullptr) {
@@ -97,7 +98,12 @@ Status Transaction::Get(const ReadOptions& options, const Slice& key,
     return Status::OK();
   }
 
-  return ValidateSnapshotIsolation(db_, snapshot_, key, value);
+  s = ValidateSnapshotIsolation(db_, snapshot_, key, value);
+  if (!s.ok()) {
+    Abort();
+  }
+  read_set_.insert(key_str);
+  return s;
 }
 
 Status Transaction::Put(const Slice& key, const Slice& value) {
@@ -135,20 +141,6 @@ Status Transaction::Delete(const Slice& key) {
   return Status::OK();
 }
 
-Status Transaction::ValidateWriteSet() {
-  // Check that all keys we're writing haven't been modified
-  for (const auto& entry : write_buffer_) {
-    const std::string& key_str = entry.first;
-    Slice key(key_str);
-    Status s = ValidateSnapshotIsolation(db_, snapshot_, key, nullptr);
-    if (!s.ok()) {
-      return s;
-    }
-  }
-
-  return Status::OK();
-}
-
 Status Transaction::Commit() {
   Status s = CheckActive();
   if (!s.ok()) {
@@ -157,18 +149,29 @@ Status Transaction::Commit() {
 
   // If no writes, just mark as committed
   if (write_buffer_.empty()) {
-    committed_ = true;
+    state_ = TransactionState::COMMITTED;
     return Status::OK();
   }
 
   // Acquire global commit lock to prevent race conditions during validation
   // This ensures atomicity of validation + commit
-  std::lock_guard<std::mutex> lock(TransactionManager::Instance().GetCommitLock());
-
-  // Validate write set (detect write-write conflicts)
-  s = ValidateWriteSet();
-  if (!s.ok()) {
-    return s;
+  std::lock_guard<std::mutex> lock(commit_mutex_);
+  for (const auto& key : read_set_) {
+    std::string value;
+    Slice key_slice(key);
+    s = ValidateSnapshotIsolation(db_, snapshot_, key_slice, &value);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  for (const auto& entry : write_buffer_) {
+    std::string value;
+    const std::string& key_str = entry.first;
+    Slice key(key_str);
+    Status s = ValidateSnapshotIsolation(db_, snapshot_, key, &value);
+    if (!s.ok()) {
+      return s;
+    }
   }
 
   // All validations passed, apply writes
@@ -176,23 +179,27 @@ Status Transaction::Commit() {
   s = db_->Write(write_opts, &write_batch_);
   
   if (s.ok()) {
-    committed_ = true;
+    state_ = TransactionState::COMMITTED;
+    // Clear buffers
+    write_buffer_.clear();
+    write_batch_.Clear();
+  } else {
+    Abort();  // Rollback on failure
   }
   
   return s;
 }
 
 Status Transaction::Abort() {
-  if (committed_) {
+  if (state_ == TransactionState::COMMITTED) {
     return Status::InvalidArgument("Cannot rollback: transaction already committed");
   }
-  
-  if (aborted_) {
+
+  if (state_ == TransactionState::ABORTED) {
     return Status::OK();  // Already aborted
   }
 
-  aborted_ = true;
-  read_set_.clear();
+  state_ = TransactionState::ABORTED;
   write_buffer_.clear();
   write_batch_.Clear();
   

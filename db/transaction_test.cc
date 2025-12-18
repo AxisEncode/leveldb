@@ -186,6 +186,7 @@ TEST_F(TransactionTest, ConcurrentMultiKeyTransfers) {
         ia = std::stoi(va);
         ib = std::stoi(vb);
       } catch (...) {
+        printf("Invalid integer value encountered, %s, %s\n", va.c_str(), vb.c_str());
         txn.Abort();
         continue;
       }

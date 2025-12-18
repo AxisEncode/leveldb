@@ -10,22 +10,6 @@
 
 namespace leveldb {
 
-// Global commit lock to prevent race conditions during validation
-// In production, consider per-key locking or more sophisticated MVCC
-class TransactionManager {
- public:
-  static TransactionManager& Instance() {
-    static TransactionManager instance;
-    return instance;
-  }
-  
-  std::mutex& GetCommitLock() { return commit_lock_; }
-  
- private:
-  std::mutex commit_lock_;
-  TransactionManager() = default;
-};
-
 class Transaction {
  public:
   explicit Transaction(DB* db);
@@ -47,8 +31,12 @@ class Transaction {
   Status Abort();
 
   // Transaction state
-  bool IsCommitted() const { return committed_; }
-  bool IsAborted() const { return aborted_; }
+  enum class TransactionState {
+    ACTIVE,
+    COMMITTED,
+    ABORTED
+  };
+  TransactionState state() const { return state_; }
 
  private:
   struct BufferEntry {
@@ -67,14 +55,14 @@ class Transaction {
   Status CheckActive() const;
   Status ValidateWriteSet();
 
+  static std::mutex commit_mutex_;
+
   DB* db_;
   const Snapshot* snapshot_;
-  bool committed_;
-  bool aborted_;
+  TransactionState state_;
 
-  std::unordered_set<std::string> read_set_; // Track reads for conflict detection
+  std::unordered_set<std::string> read_set_;  // Track read keys for validation
   std::unordered_map<std::string, BufferEntry> write_buffer_; // Track writes with proper tombstone semantics
-  
   WriteBatch write_batch_;
 };
 
